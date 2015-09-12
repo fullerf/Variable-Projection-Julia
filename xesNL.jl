@@ -291,26 +291,35 @@ end
 type Stats{T<:Base.LinAlg.BlasFloat}
     N::Int
     ys::Array{T,2}
+    yhats::Array{T,2}
     βs::Array{T,2}
     αs::Array{T,2}
+    rsss::Array{T,1}
     yhat::Array{T,1}
+    βinput::Array{T,1}
     samples::Array{Int,1}
     residual::Array{T,1}
     dist::Distributions.DiscreteUniform
     nl::NLSolver{T}
     function Stats(N::Int, nl::NLSolver{T})
         ys = zeros(T,(nl.ls.ls.params.xlen,N))
+        yhats = zeros(T,(nl.ls.ls.params.xlen,N))
         βs = zeros(T,(length(nl.ls.ls.β),N))
         αs = zeros(T,(length(nl.ls.ls.α),N))
+        rsss = zeros(T,N)
         yhat = nl.ls.ls.m*nl.ls.ls.α
-        samples = zeros(Int,zeros(yhat))
+        βinput = copy(nl.ls.ls.β)
+        samples = zeros(Int,size(yhat))
         residual = copy(nl.ls.ls.residual)
         dist = DiscreteUniform(1,nl.ls.ls.params.xlen)
-        return new(ys,βs,αs,yhat,residual,nl,N)
+        return new(N,ys,yhats,βs,αs,rsss,yhat,βinput,samples,residual,dist,nl)
     end
 end
 
-call{T<:Base.LinAlg.BlasFloat}(s::Stats{T}) = residualBootStrap!(s)
+function call{T<:Base.LinAlg.BlasFloat}(s::Stats{T})
+    residualBootStrap!(s)
+    s.nl.ls(s.βinput) #return solver to input state
+end
 
 function resample!{T<:Base.LinAlg.BlasFloat}(v::AbstractVector{T},source::Vector{T},p::Vector{Int})
     L = length(v)
@@ -327,8 +336,8 @@ function genSynthData!{T<:Base.LinAlg.BlasFloat}(s::Stats{T})
     for k=1:K
         rand!(s.dist,s.samples)
         sub_ys = sub(s.ys,:,k)
-        resample!(sub_ys,residual,rand(dist,J))
-        Base.LinAlg.BLAS.axpy(one(T),s.yhat,sub_ys)
+        resample!(sub_ys,s.residual,rand(s.dist,J))
+        Base.LinAlg.BLAS.axpy!(one(T),s.yhat,sub_ys)
     end
     return nothing
 end
@@ -341,10 +350,13 @@ function residualBootStrap!(s::Stats)
         sub_ys = sub(s.ys,:,k)
         sub_αs = sub(s.αs,:,k)
         sub_βs = sub(s.βs,:,k)
+        sub_yhats = sub(s.yhats,:,k)
         copy!(s.nl.ls.ls.y,sub_ys)
         s.nl(β0)
         copy!(sub_αs,s.nl.ls.ls.α)
         copy!(sub_βs,s.nl.ls.ls.β)
+        s.rsss[k] = s.nl.ls.ls.rss
+        copy!(sub_yhats, s.nl.ls.ls.m*s.nl.ls.ls.α)
     end
     return nothing
 end
@@ -425,13 +437,7 @@ function rcgsu!{T<:Base.LinAlg.BlasFloat}(Q::Array{T,2},ind::Int,a::AbstractArra
     @assert ind<=K
     @assert length(r) == J
     Qs = sub(Q,:,1:ind)
-    cnorm = colnorm(Qs)
-    @assert all(cnorm .< (1.0+ϵ)) #if not true this thing will explode
-    # we expect length(p)<<J for this application.
-    # I also expect to call rcgsu for changing lengths of p.  
-    # So we allocate it inside
-    p = zeros(T,ind)
-    
+    p = zeros(T,ind)    
     #do one iteration first, then test if more are needed.
     #first normalize the vector to be orthogonalized
     scale!(a,1/norm(a))
@@ -443,6 +449,9 @@ function rcgsu!{T<:Base.LinAlg.BlasFloat}(Q::Array{T,2},ind::Int,a::AbstractArra
     Base.LinAlg.BLAS.axpy!(-one(T),r,a)
     o = maximum(abs(p))
     while o>ϵ
+    c = 1
+    while o>ϵ && c<10 #maximum 10 iterations allowed
+        c = c+1
         #we need to iterate a few times over this process in order
         #to achieve a desired level of orthogonality
         #usually 2-3 iterations is enough to hit machine precsion
@@ -452,6 +461,12 @@ function rcgsu!{T<:Base.LinAlg.BlasFloat}(Q::Array{T,2},ind::Int,a::AbstractArra
         o = maximum(abs(p))
     end
     scale!(a,1/norm(a))
+    sfactor = norm(a)
+    if sfactor > length(a)*eps(T)
+        scale!(a,1/sfactor)
+    else
+        fill!(a,zero(T)) #if norm(a) is close to zero or NaN, we zero out the vector as it was probably exactly overlapped with a previous column 
+    end
     return a
 end
 
@@ -460,7 +475,7 @@ function orthogonalize!{T<:Base.LinAlg.BlasFloat}(Q::Array{T,2},r::Array{T,1},ϵ
     @assert K>0
     J = size(Q,1)
     view = sub(Q,:,1)
-    if norm(view) > (1+ϵ)
+    if norm(view) > (1.0+ϵ)
         scale!(view,1/norm(view)) #inplace scaling
     end
     @assert length(r)==J
