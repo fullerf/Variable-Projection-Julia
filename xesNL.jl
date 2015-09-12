@@ -448,7 +448,6 @@ function rcgsu!{T<:Base.LinAlg.BlasFloat}(Q::Array{T,2},ind::Int,a::AbstractArra
     #updates a, removing r from a
     Base.LinAlg.BLAS.axpy!(-one(T),r,a)
     o = maximum(abs(p))
-    while o>ϵ
     c = 1
     while o>ϵ && c<10 #maximum 10 iterations allowed
         c = c+1
@@ -460,7 +459,6 @@ function rcgsu!{T<:Base.LinAlg.BlasFloat}(Q::Array{T,2},ind::Int,a::AbstractArra
         Base.LinAlg.BLAS.axpy!(-one(T),r,a)
         o = maximum(abs(p))
     end
-    scale!(a,1/norm(a))
     sfactor = norm(a)
     if sfactor > length(a)*eps(T)
         scale!(a,1/sfactor)
