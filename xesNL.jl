@@ -9,6 +9,7 @@ export
     UnboundedLinSolver,
     NLGlobalSolver,
     NLLocalSolver,
+    Stats,
 
     #lineshapes 
     lorentzFun!, 
@@ -25,6 +26,7 @@ export
     vecrange 
 
 using NLopt
+using Distributions
 
 ## Custom Types & Call Overloads
 
@@ -224,8 +226,9 @@ end
 # to use higher precision.  With bootstrapping, the local solver will also let you explore the
 # local minimum you found with the global solver.
 
+abstract NLSolver{T<:Base.LinAlg.BlasFloat}
 
-type NLGlobalSolver{T<:Base.LinAlg.BlasFloat}
+type NLGlobalSolver{T<:Base.LinAlg.BlasFloat} <: NLSolver{T}
     o::Opt
     ls::LinSolver
     maxtime::Float64
@@ -250,7 +253,7 @@ type NLGlobalSolver{T<:Base.LinAlg.BlasFloat}
     end
 end
 
-function call{T}(nl::NLGlobalSolver{T},β0::Array{T,1})
+function call{T<:Base.LinAlg.BlasFloat}(nl::NLGlobalSolver{T},β0::Array{T,1})
     nl.ls.ls.calls = 0
     updateBasis(nl.ls.ls,β0)
     optimize!(nl.o::Opt,nl.ls.ls.β::Array{T,1})
@@ -258,7 +261,7 @@ function call{T}(nl::NLGlobalSolver{T},β0::Array{T,1})
     return nothing
 end
 
-type NLLocalSolver{T}
+type NLLocalSolver{T<:Base.LinAlg.BlasFloat} <: NLSolver{T}
     o::Opt
     ls::LinSolver{T}
     xtol::Float64
@@ -276,13 +279,78 @@ type NLLocalSolver{T}
     end
 end
 
-function call{T}(nl::NLLocalSolver{T},β0::Array{T,1})
+function call{T<:Base.LinAlg.BlasFloat}(nl::NLLocalSolver{T},β0::Array{T,1})
     nl.ls.ls.calls = 0
     updateBasis(nl.ls.ls,β0)
     optimize!(nl.o::Opt,nl.ls.ls.β::Array{T,1})
     nl.ls(nl.ls.ls.β)
     return nothing
 end
+## Here are some types associated with statistical error estimation
+
+type Stats{T<:Base.LinAlg.BlasFloat}
+    N::Int
+    ys::Array{T,2}
+    βs::Array{T,2}
+    αs::Array{T,2}
+    yhat::Array{T,1}
+    samples::Array{Int,1}
+    residual::Array{T,1}
+    dist::Distributions.DiscreteUniform
+    nl::NLSolver{T}
+    function Stats(N::Int, nl::NLSolver{T})
+        ys = zeros(T,(nl.ls.ls.params.xlen,N))
+        βs = zeros(T,(length(nl.ls.ls.β),N))
+        αs = zeros(T,(length(nl.ls.ls.α),N))
+        yhat = nl.ls.ls.m*nl.ls.ls.α
+        samples = zeros(Int,zeros(yhat))
+        residual = copy(nl.ls.ls.residual)
+        dist = DiscreteUniform(1,nl.ls.ls.params.xlen)
+        return new(ys,βs,αs,yhat,residual,nl,N)
+    end
+end
+
+call{T<:Base.LinAlg.BlasFloat}(s::Stats{T}) = residualBootStrap!(s)
+
+function resample!{T<:Base.LinAlg.BlasFloat}(v::AbstractVector{T},source::Vector{T},p::Vector{Int})
+    L = length(v)
+    t = zero(T)
+    @inbounds for k=1:L
+        t = source[p[k]]
+        v[k] = t
+    end
+    v
+end
+
+function genSynthData!{T<:Base.LinAlg.BlasFloat}(s::Stats{T})
+    (J,K) = size(s.ys)
+    for k=1:K
+        rand!(s.dist,s.samples)
+        sub_ys = sub(s.ys,:,k)
+        resample!(sub_ys,residual,rand(dist,J))
+        Base.LinAlg.BLAS.axpy(one(T),s.yhat,sub_ys)
+    end
+    return nothing
+end
+
+function residualBootStrap!(s::Stats)
+    (J,K) = size(s.ys)
+    genSynthData!(s)
+    β0 = copy(s.nl.ls.ls.β)
+    for k=1:K
+        sub_ys = sub(s.ys,:,k)
+        sub_αs = sub(s.αs,:,k)
+        sub_βs = sub(s.βs,:,k)
+        copy!(s.nl.ls.ls.y,sub_ys)
+        s.nl(β0)
+        copy!(sub_αs,s.nl.ls.ls.α)
+        copy!(sub_βs,s.nl.ls.ls.β)
+    end
+    return nothing
+end
+
+
+
 
 ## Utility Functions: Anything that isn't a type, call overload, or lineshape function goes here
 
@@ -310,9 +378,9 @@ function linObjective{T<:Base.LinAlg.BlasFloat}(α::Array{T,1},ls::LinSystem{T})
     return ls.rss
 end
 
-function updateBasis{T}(ls::LinSystem{T}, β::Array{T,1})
-    Base.LinAlg.BLAS.blascopy!(ls.params.βlen,β,1,ls.β,1)
-    mapLines!(ls.m,ls.params.axis,β,ls.params.f)
+function updateBasis{T<:Base.LinAlg.BlasFloat}(ls::LinSystem{T}, β::Array{T,1})
+    Base.LinAlg.BLAS.blascopy!(ls.params.βlen,β,stride(β,1),ls.β,stride(ls.β,1))
+    mapLines!(ls.m,ls.params.axis,ls.β,ls.params.f)
     orthogonalize!(ls.m,ls.t,5*eps(T))
 end
 
